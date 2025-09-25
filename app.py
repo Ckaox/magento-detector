@@ -71,13 +71,91 @@ class MagentoDetector:
         }
     
     def _validate_magento_version(self, version_string):
-        """Validar si una versión es válida para Magento"""
+        """Validar si una versión es válida para Magento con validación estricta"""
         if not version_string:
             return None
         
-        for version_type, pattern in self.valid_magento_versions.items():
-            if re.match(pattern, version_string):
-                return version_string
+        # Lista de versiones válidas conocidas de Magento
+        valid_magento_versions = {
+            # Magento 1.x versions (principales)
+            '1.x': ['1.4', '1.5', '1.6', '1.7', '1.8', '1.9'],
+            '1.4': ['1.4.0', '1.4.1', '1.4.2'],
+            '1.5': ['1.5.0', '1.5.1'],
+            '1.6': ['1.6.0', '1.6.1', '1.6.2'],
+            '1.7': ['1.7.0', '1.7.1'],
+            '1.8': ['1.8.0', '1.8.1'],
+            '1.9': ['1.9.0', '1.9.1', '1.9.2', '1.9.3', '1.9.4'],
+            
+            # Magento 2.x versions (principales)
+            '2.x': ['2.0', '2.1', '2.2', '2.3', '2.4'],
+            '2.0': ['2.0.0', '2.0.1', '2.0.2', '2.0.3', '2.0.4', '2.0.5', '2.0.6', '2.0.7', '2.0.8', '2.0.9', '2.0.10', '2.0.11', '2.0.12', '2.0.13', '2.0.14', '2.0.15', '2.0.16', '2.0.17', '2.0.18'],
+            '2.1': ['2.1.0', '2.1.1', '2.1.2', '2.1.3', '2.1.4', '2.1.5', '2.1.6', '2.1.7', '2.1.8', '2.1.9', '2.1.10', '2.1.11', '2.1.12', '2.1.13', '2.1.14', '2.1.15', '2.1.16', '2.1.17', '2.1.18'],
+            '2.2': ['2.2.0', '2.2.1', '2.2.2', '2.2.3', '2.2.4', '2.2.5', '2.2.6', '2.2.7', '2.2.8', '2.2.9', '2.2.10', '2.2.11'],
+            '2.3': ['2.3.0', '2.3.1', '2.3.2', '2.3.3', '2.3.4', '2.3.5', '2.3.6', '2.3.7'],
+            '2.4': ['2.4.0', '2.4.1', '2.4.2', '2.4.3', '2.4.4', '2.4.5', '2.4.6', '2.4.7']
+        }
+        
+        # Normalizar versión
+        version = version_string.strip()
+        
+        # Validar formato básico primero
+        if not re.match(r'^\d+\.\d+(\.\d+)?(\.\d+)?$', version):
+            return None
+        
+        # Verificar que no tenga más de 4 partes (major.minor.patch.build)
+        version_parts = version.split('.')
+        if len(version_parts) > 4:
+            return None
+            
+        # Verificar que cada parte sea un número razonable
+        for part in version_parts:
+            try:
+                num = int(part)
+                if num > 999:  # Rechazar números muy grandes (como 551, 423, 337, 862)
+                    return None
+            except ValueError:
+                return None
+        
+        # Verificar rangos válidos para major.minor
+        if len(version_parts) >= 2:
+            major = int(version_parts[0])
+            minor = int(version_parts[1])
+            
+            # Solo aceptar Magento 1.x y 2.x
+            if major == 1:
+                if minor < 4 or minor > 9:  # 1.4 - 1.9
+                    return None
+            elif major == 2:
+                if minor < 0 or minor > 4:  # 2.0 - 2.4
+                    return None
+            else:
+                return None  # Solo Magento 1.x y 2.x son válidos
+        
+        # Verificar en lista de versiones conocidas si es versión específica
+        major_minor = f"{version_parts[0]}.{version_parts[1]}"
+        if len(version_parts) >= 3:
+            # Versión específica como 2.4.3
+            for version_family, versions in valid_magento_versions.items():
+                if isinstance(versions, list) and version in versions:
+                    return version
+                    
+            # Si no está en la lista exacta, verificar que al menos el major.minor sea válido
+            if major_minor in ['1.4', '1.5', '1.6', '1.7', '1.8', '1.9', '2.0', '2.1', '2.2', '2.3', '2.4']:
+                # Permitir patch versions razonables (0-20)
+                if len(version_parts) >= 3:
+                    patch = int(version_parts[2])
+                    if patch > 20:
+                        return None
+                # Permitir build versions razonables (0-10)        
+                if len(version_parts) == 4:
+                    build = int(version_parts[3])
+                    if build > 10:
+                        return None
+                return version
+        else:
+            # Versión general como 2.x, 1.9
+            if version in ['1.x', '2.x'] or major_minor in ['1.4', '1.5', '1.6', '1.7', '1.8', '1.9', '2.0', '2.1', '2.2', '2.3', '2.4']:
+                return version
         
         return None
     
@@ -916,21 +994,50 @@ class MagentoDetector:
             }
     
     def _extract_version_from_content(self, content):
-        """Extraer versión de cualquier contenido"""
+        """Extraer versión de cualquier contenido con patrones más precisos"""
+        # Patrones más específicos y ordenados por confianza
         version_patterns = [
-            r"Magento\s*[\/\s]*(\d+\.\d+(?:\.\d+)?)",
-            r"version['\"\s]*=>['\"\s]*['\"](\d+\.\d+(?:\.\d+)?)['\"]",
-            r"VERSION['\"\s]*=['\"\s]*['\"](\d+\.\d+(?:\.\d+)?)['\"]",
-            r"define\s*\(\s*['\"]MAGENTO_VERSION['\"]\s*,\s*['\"](\d+\.\d+(?:\.\d+)?)['\"]",
-            r"(\d+\.\d+\.\d+(?:\.\d+)?)"  # Pattern genérico para versiones
+            # Patrones muy específicos de Magento (alta confianza)
+            r"define\s*\(\s*['\"]MAGENTO_VERSION['\"]\s*,\s*['\"](\d+\.\d+(?:\.\d+)?(?:\.\d+)?)['\"]",  # PHP define
+            r"Magento\s*[\/\-\s]+v?(\d+\.\d+(?:\.\d+)?(?:\.\d+)?)",  # "Magento 2.4.3" o "Magento/2.4"
+            r"version['\"\s]*=>['\"\s]*['\"](\d+\.\d+(?:\.\d+)?(?:\.\d+)?)['\"]",  # Array version
+            r"VERSION['\"\s]*=['\"\s]*['\"](\d+\.\d+(?:\.\d+)?(?:\.\d+)?)['\"]",  # Constante VERSION
+            r"magento[_\-]?version['\"\s]*[:\-=]['\"\s]*[v]?(\d+\.\d+(?:\.\d+)?(?:\.\d+)?)",  # magento_version
+            r"release[_\-]?version['\"\s]*[:\-=]['\"\s]*[v]?(\d+\.\d+(?:\.\d+)?(?:\.\d+)?)",  # release_version
+            
+            # Patrones en comentarios (media confianza)
+            r"<!--.*?magento\s+v?(\d+\.\d+(?:\.\d+)?(?:\.\d+)?).*?-->",  # Comentarios HTML
+            r"\/\*.*?magento\s+v?(\d+\.\d+(?:\.\d+)?(?:\.\d+)?).*?\*\/",  # Comentarios CSS/JS
+            
+            # Patrones en meta tags (media confianza)
+            r"<meta[^>]*content=['\"].*?magento\s+v?(\d+\.\d+(?:\.\d+)?(?:\.\d+)?).*?['\"][^>]*>",  # Meta tags
+            
+            # Patrones generales (baja confianza) - SOLO si parecen versiones de Magento
+            r"\bv?(\d+\.\d+\.\d+)\b(?![.\d])",  # Versión específica sin contexto (más restrictivo)
         ]
         
         for pattern in version_patterns:
-            matches = re.finditer(pattern, content, re.IGNORECASE)
+            matches = re.finditer(pattern, content, re.IGNORECASE | re.DOTALL)
             for match in matches:
                 potential_version = match.group(1)
-                if self._validate_magento_version(potential_version):
-                    return potential_version
+                
+                # Validación adicional para patrones generales
+                if pattern == r"\bv?(\d+\.\d+\.\d+)\b(?![.\d])":
+                    # Para patrones generales, ser más estricto
+                    parts = potential_version.split('.')
+                    if len(parts) == 3:
+                        try:
+                            major, minor, patch = int(parts[0]), int(parts[1]), int(parts[2])
+                            # Solo aceptar si parece una versión de Magento
+                            if not ((major == 1 and 4 <= minor <= 9 and patch <= 20) or 
+                                   (major == 2 and 0 <= minor <= 4 and patch <= 20)):
+                                continue
+                        except ValueError:
+                            continue
+                
+                validated_version = self._validate_magento_version(potential_version)
+                if validated_version:
+                    return validated_version
         
         return None
     
