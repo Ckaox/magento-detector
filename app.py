@@ -25,6 +25,7 @@ class MagentoDetector:
             'Upgrade-Insecure-Requests': '1'
         })
         self.vulnerabilities_db = self._load_vulnerabilities()
+        self.valid_magento_versions = self._get_valid_version_patterns()
     
     def _load_vulnerabilities(self):
         """Base de datos de vulnerabilidades conocidas de Magento"""
@@ -62,6 +63,56 @@ class MagentoDetector:
             }
         }
     
+    def _get_valid_version_patterns(self):
+        """Patrones de versiones válidas de Magento"""
+        return {
+            "1.x": r"^1\.[4-9]\.\d+(\.\d+)?$",  # 1.4.0 - 1.9.4.5
+            "2.x": r"^2\.[0-4]\.\d+(\.\d+)?$"   # 2.0.0 - 2.4.6
+        }
+    
+    def _validate_magento_version(self, version_string):
+        """Validar si una versión es válida para Magento"""
+        if not version_string:
+            return None
+        
+        for version_type, pattern in self.valid_magento_versions.items():
+            if re.match(pattern, version_string):
+                return version_string
+        
+        return None
+    
+    def _quick_version_detection(self, url, html_content):
+        """Detección rápida de versión para early exit"""
+        try:
+            # Buscar versión en HTML (más rápido que requests adicionales)
+            version_patterns = [
+                r'magento[\/\s]+(\d+\.\d+(?:\.\d+)?)',
+                r'magento\s*version[:\s]+(\d+\.\d+(?:\.\d+)?)',
+                r'mage["\s]*version["\s]*[:\s]*["\'](\d+\.\d+(?:\.\d+)?)["\']',
+            ]
+            
+            for pattern in version_patterns:
+                matches = re.finditer(pattern, html_content, re.IGNORECASE)
+                for match in matches:
+                    potential_version = match.group(1)
+                    validated_version = self._validate_magento_version(potential_version)
+                    if validated_version:
+                        return validated_version
+            
+            # Solo si no encontramos en HTML, intentar endpoint rápido
+            from urllib.parse import urljoin
+            version_response = self._safe_request(urljoin(url, '/magento_version'), timeout=1)
+            if version_response and version_response.status_code == 200:
+                content = version_response.text
+                version_match = re.search(r'Magento[\/\s]*(\d+\.\d+(?:\.\d+)?)', content, re.IGNORECASE)
+                if version_match:
+                    potential_version = version_match.group(1)
+                    return self._validate_magento_version(potential_version)
+            
+            return None
+        except:
+            return None
+    
     def analyze_url(self, url):
         """Analiza una URL para detectar Magento"""
         try:
@@ -73,7 +124,7 @@ class MagentoDetector:
             original_url = url
             if not url.startswith(('https://www.', 'http://www.')):
                 # Probar primero sin www
-                test_response = self._safe_request(url, timeout=3)
+                test_response = self._safe_request(url, timeout=1)
                 if test_response and test_response.status_code in [301, 302, 307, 308]:
                     # Si hay redirección, usar la URL redirigida
                     redirect_url = test_response.headers.get('location', '')
@@ -111,7 +162,7 @@ class MagentoDetector:
             }
     
     def _detect_magento(self, url):
-        """Detecta si el sitio usa Magento"""
+        """Detecta si el sitio usa Magento con optimización para velocidad"""
         evidence = []
         confidence = 0
         version = None
@@ -124,21 +175,29 @@ class MagentoDetector:
                 html_content = response.text.lower()
                 headers = response.headers
                 
-                # Verificar headers específicos (más exhaustivo)
-                magento_headers = [
-                    'x-magento-cache-control',
-                    'x-magento-cache-debug',
-                    'x-magento-tags',
-                    'x-magento-vary',
-                    'x-content-type-options',
-                    'set-cookie'
-                ]
-                
-                for header in magento_headers:
+                # Verificar headers específicos de Magento (PRIORITY: más confiables)
+                priority_headers = ['x-magento-cache-control', 'x-magento-cache-debug', 'x-magento-tags', 'x-magento-vary']
+                for header in priority_headers:
                     if header in headers:
                         evidence.append(f"Magento header found: {header}")
-                        confidence += 20
+                        confidence += 30
                         is_magento = True
+                        # EARLY EXIT: Si encontramos header específico de Magento, es 100% seguro
+                        if confidence >= 60:
+                            return {
+                                'is_magento': True,
+                                'version': self._quick_version_detection(url, html_content),
+                                'confidence': min(confidence, 100),
+                                'evidence': evidence
+                            }
+                
+                # Headers secundarios (menos específicos, menor peso)
+                secondary_headers = [('x-content-type-options', 10), ('set-cookie', 5)]
+                for header, score in secondary_headers:
+                    if header in headers:
+                        evidence.append(f"Magento header found: {header}")
+                        confidence += score
+                        # No marcar como Magento solo por headers genéricos
                 
                 # Verificar cookies específicas de Magento
                 set_cookie = headers.get('set-cookie', '').lower()
@@ -149,103 +208,125 @@ class MagentoDetector:
                         confidence += 15
                         is_magento = True
                 
-                # Buscar patrones en HTML (más específicos y exhaustivos)
-                magento_patterns = [
-                    r'magento',
-                    r'mage/cookies\.js',
-                    r'skin/frontend',
-                    r'var/www/html/magento',
-                    r'media/catalog',
-                    r'checkout/cart',
-                    r'customer/account',
-                    r'catalogsearch/result',
-                    r'/static/version\d+/',
-                    r'mage\.cookies',
-                    r'RequireJS',
-                    r'data-mage-init',
-                    r'Magento_',
-                    r'/pub/static/',
-                    r'/pub/media/',
-                    r'var/view_preprocessed/',
-                    r'mage/requirejs/mixins',
-                    r'Magento\\\\'
+                # Buscar patrones específicos de Magento (PRIORIDAD: más confiables primero)
+                # Patrones de ALTA CONFIANZA primero
+                high_confidence_patterns = [
+                    (r'data-mage-init', 25),  # Muy específico de Magento 2
+                    (r'Magento_[A-Za-z]+', 30),  # Módulos de Magento
+                    (r'/pub/static/version\d+/', 25),  # Static files con versioning
+                    (r'Magento\\\\', 30),  # Namespace en código
                 ]
                 
-                for pattern in magento_patterns:
-                    if re.search(pattern, html_content):
-                        evidence.append(f"Magento pattern found: {pattern}")
-                        confidence += 10
+                for pattern, score in high_confidence_patterns:
+                    if re.search(pattern, html_content, re.IGNORECASE):
+                        evidence.append(f"High-confidence Magento pattern: {pattern}")
+                        confidence += score
                         is_magento = True
+                        # EARLY EXIT: Si tenemos alta confianza, salir rápido
+                        if confidence >= 70:
+                            return {
+                                'is_magento': True,
+                                'version': self._quick_version_detection(url, html_content),
+                                'confidence': min(confidence, 100),
+                                'evidence': evidence
+                            }
                 
-                # Detectar versión desde meta tags o comentarios
+                # Solo si no tenemos alta confianza, buscar patrones secundarios
+                if confidence < 50:
+                    secondary_patterns = [
+                        (r'mage/cookies\.js', 15),
+                        (r'skin/frontend', 12),  # Magento 1.x
+                        (r'/media/catalog/product/', 15),
+                        (r'checkout/cart', 8),
+                        (r'customer/account/login', 10),
+                        (r'catalogsearch/result', 8),
+                        (r'mage\.cookies', 12),
+                        (r'var/view_preprocessed/', 15),
+                        (r'mage/requirejs/mixins', 15),
+                        (r'require\.js.*mage', 12)
+                    ]
+                    
+                    for pattern, score in secondary_patterns:
+                        if re.search(pattern, html_content, re.IGNORECASE):
+                            evidence.append(f"Magento pattern found: {pattern}")
+                            confidence += score
+                            is_magento = True
+                
+                # Detectar versión desde meta tags o comentarios (más específico)
                 version_patterns = [
-                    r'magento\s+(\d+\.\d+(?:\.\d+)?)',
-                    r'version["\s]*:\s*["\'](\d+\.\d+(?:\.\d+)?)["\']',
-                    r'mage["\s]*version["\s]*[:\s]*["\'](\d+\.\d+(?:\.\d+)?)["\']'
+                    r'magento[\/\s]+(\d+\.\d+(?:\.\d+)?)',
+                    r'magento\s*version[:\s]+(\d+\.\d+(?:\.\d+)?)',
+                    r'mage["\s]*version["\s]*[:\s]*["\'](\d+\.\d+(?:\.\d+)?)["\']',
+                    r'<!--.*magento\s+(\d+\.\d+(?:\.\d+)?).*-->',
+                    r'data-version["\s]*=["\s]*["\'](\d+\.\d+(?:\.\d+)?)["\']'
                 ]
                 
                 for pattern in version_patterns:
-                    match = re.search(pattern, html_content)
-                    if match:
-                        version = match.group(1)
-                        evidence.append(f"Version detected from HTML: {version}")
-                        confidence += 30
+                    matches = re.finditer(pattern, html_content, re.IGNORECASE)
+                    for match in matches:
+                        potential_version = match.group(1)
+                        validated_version = self._validate_magento_version(potential_version)
+                        if validated_version:
+                            version = validated_version
+                            evidence.append(f"Valid Magento version detected from HTML: {version}")
+                            confidence += 30
+                            break
+                    if version:
                         break
             
-            # 2. Verificar archivos específicos de Magento (más exhaustivo)
-            magento_files = [
-                '/js/mage/cookies.js',
-                '/skin/frontend/',
-                '/media/catalog/',
-                '/api.php',
-                '/pub/static/',
-                '/pub/media/',
-                '/static/version',
-                '/app/etc/config.xml',
-                '/downloader/',
-                '/cron.php',
-                '/index.php',
-                '/setup/',
-                '/var/cache/',
-                '/vendor/magento/'
-            ]
+            # 2. Solo verificar archivos si no tenemos alta confianza (OPTIMIZACIÓN)
+            if confidence < 70:
+                # Solo verificar archivos más específicos y rápidos primero
+                priority_files = [
+                    '/js/mage/cookies.js',
+                    '/pub/static/',
+                    '/media/catalog/',
+                    '/skin/frontend/',
+                ]
+                
+                for file_path in priority_files:
+                    if self._check_file_exists(url, file_path):
+                        evidence.append(f"Magento file found: {file_path}")
+                        confidence += 20
+                        is_magento = True
+                        # Si ya tenemos buena confianza, parar verificaciones
+                        if confidence >= 70:
+                            break
             
-            for file_path in magento_files:
-                if self._check_file_exists(url, file_path):
-                    evidence.append(f"Magento file found: {file_path}")
-                    confidence += 15
-                    is_magento = True
+            # 3. Solo buscar versión y hacer verificaciones adicionales si no tenemos alta confianza
+            if confidence < 70:
+                # Verificar versión desde archivos específicos (solo si es necesario)
+                if not version:
+                    version = self._detect_version_from_files(url)
+                    if version:
+                        evidence.append(f"Version detected from files: {version}")
+                        confidence += 25
+                
+                # Solo si aún no tenemos confianza suficiente, hacer verificaciones adicionales
+                if confidence < 50:
+                    # Analizar estructura de URLs
+                    url_pattern_result = self._check_magento_url_patterns(url)
+                    if url_pattern_result:
+                        if url_pattern_result == "magento_blocked":
+                            evidence.append("Magento version endpoint exists but is blocked (protected)")
+                            confidence += 30
+                            is_magento = True
+                        elif url_pattern_result == True:
+                            evidence.append("Magento URL patterns detected")
+                            confidence += 15
+                            is_magento = True
+                
+                # Fallback solo si realmente no tenemos evidencia
+                if confidence < 30:
+                    fallback_result = self._fallback_detection(url)
+                    if fallback_result:
+                        evidence.extend(fallback_result['evidence'])
+                        confidence += fallback_result['confidence']
+                        if fallback_result['version']:
+                            version = fallback_result['version']
             
-            # 3. Verificar versión desde archivos específicos
-            if not version:
-                version = self._detect_version_from_files(url)
-                if version:
-                    evidence.append(f"Version detected from files: {version}")
-                    confidence += 25
-            
-            # 4. Analizar estructura de URLs y detección especial
-            url_pattern_result = self._check_magento_url_patterns(url)
-            if url_pattern_result:
-                if url_pattern_result == "magento_blocked":
-                    evidence.append("Magento version endpoint exists but is blocked (protected)")
-                    confidence += 25
-                    is_magento = True
-                elif url_pattern_result == True:
-                    evidence.append("Magento URL patterns detected")
-                    confidence += 10
-                    is_magento = True
-            
-            # 5. Método de fallback para sitios con protecciones
-            if not is_magento and confidence < 20:
-                fallback_result = self._fallback_detection(url)
-                if fallback_result:
-                    evidence.extend(fallback_result['evidence'])
-                    confidence += fallback_result['confidence']
-                    if fallback_result['version']:
-                        version = fallback_result['version']
-            
-            # Determinar si es Magento basado en confianza (umbral más bajo)
-            if confidence >= 20:
+            # Determinar si es Magento basado en confianza (umbral optimizado)
+            if confidence >= 25:  # Subir umbral para evitar falsos positivos
                 is_magento = True
             
             return {
@@ -264,8 +345,8 @@ class MagentoDetector:
                 'evidence': [f"Error during detection: {str(e)}"]
             }
     
-    def _safe_request(self, url, timeout=5):
-        """Realizar request seguro con timeout corto"""
+    def _safe_request(self, url, timeout=2):
+        """Realizar request seguro con timeout muy corto para Clay"""
         try:
             response = self.session.get(url, timeout=timeout, allow_redirects=True, stream=False)
             return response
@@ -313,22 +394,24 @@ class MagentoDetector:
                     # Para /magento_version, buscar patrones específicos
                     if 'magento_version' in file_path:
                         version_patterns = [
-                            r"Magento\s+(\d+\.\d+(?:\.\d+)?)",  # "Magento 2.4.3"
+                            r"Magento\s*[\/\s]*(\d+\.\d+(?:\.\d+)?)",  # "Magento 2.4.3" o "Magento/2.4"
                             r"Version:\s*(\d+\.\d+(?:\.\d+)?)",  # "Version: 2.4.3"
-                            r"(\d+\.\d+(?:\.\d+)?)",  # Cualquier patrón de versión
                         ]
                     else:
-                        # Patrones generales
+                        # Patrones generales para otros archivos
                         version_patterns = [
-                            r"version['\"\s]*=>['\"\s]*['\"](\d+\.\d+\.\d+)['\"]",
-                            r"VERSION['\"\s]*=['\"\s]*['\"](\d+\.\d+\.\d+)['\"]",
-                            r"(\d+\.\d+\.\d+)"
+                            r"version['\"\s]*=>['\"\s]*['\"](\d+\.\d+(?:\.\d+)?)['\"]",
+                            r"VERSION['\"\s]*=['\"\s]*['\"](\d+\.\d+(?:\.\d+)?)['\"]",
+                            r"define\s*\(\s*['\"]MAGENTO_VERSION['\"]\s*,\s*['\"](\d+\.\d+(?:\.\d+)?)['\"]",
                         ]
                     
                     for pattern in version_patterns:
-                        match = re.search(pattern, content, re.IGNORECASE)
-                        if match:
-                            return match.group(1)
+                        matches = re.finditer(pattern, content, re.IGNORECASE)
+                        for match in matches:
+                            potential_version = match.group(1)
+                            validated_version = self._validate_magento_version(potential_version)
+                            if validated_version:
+                                return validated_version
             except:
                 continue
         
@@ -365,7 +448,7 @@ class MagentoDetector:
         """Verificar específicamente el endpoint /magento_version"""
         try:
             full_url = urljoin(base_url, '/magento_version')
-            response = self._safe_request(full_url, timeout=8)
+            response = self._safe_request(full_url, timeout=3)
             
             if response:
                 # Si obtenemos contenido y contiene "Magento"
@@ -410,16 +493,22 @@ class MagentoDetector:
                     temp_session.headers.update({'User-Agent': ua})
                     
                     # Probar /magento_version con diferentes UAs
-                    response = temp_session.get(urljoin(url, '/magento_version'), timeout=8)
+                    response = temp_session.get(urljoin(url, '/magento_version'), timeout=3)
                     if response.status_code == 200 and 'magento' in response.text.lower():
                         evidence.append(f"Magento version endpoint accessible with alternate UA")
                         confidence += 40
                         
-                        # Extraer versión
-                        version_match = re.search(r'Magento/(\d+\.\d+(?:\.\d+)?)', response.text, re.IGNORECASE)
+                        # Extraer y validar versión
+                        version_match = re.search(r'Magento[\/\s]*(\d+\.\d+(?:\.\d+)?)', response.text, re.IGNORECASE)
                         if version_match:
-                            version = version_match.group(1)
-                            evidence.append(f"Version detected: {version}")
+                            potential_version = version_match.group(1)
+                            validated_version = self._validate_magento_version(potential_version)
+                            if validated_version:
+                                version = validated_version
+                                evidence.append(f"Valid Magento version detected: {version}")
+                            else:
+                                evidence.append(f"Invalid version format detected: {potential_version}")
+                                confidence += 10  # Menor confianza para versiones inválidas
                         
                         break
                         
@@ -428,7 +517,7 @@ class MagentoDetector:
             
             # Verificar robots.txt para pistas de Magento
             try:
-                robots_response = requests.get(urljoin(url, '/robots.txt'), timeout=5)
+                robots_response = requests.get(urljoin(url, '/robots.txt'), timeout=2)
                 if robots_response.status_code == 200:
                     robots_content = robots_response.text.lower()
                     magento_robots_patterns = [
@@ -449,7 +538,7 @@ class MagentoDetector:
             
             # Verificar sitemap.xml
             try:
-                sitemap_response = requests.get(urljoin(url, '/sitemap.xml'), timeout=5)
+                sitemap_response = requests.get(urljoin(url, '/sitemap.xml'), timeout=2)
                 if sitemap_response.status_code == 200:
                     sitemap_content = sitemap_response.text.lower()
                     if '/catalog/' in sitemap_content or '/customer/' in sitemap_content:
